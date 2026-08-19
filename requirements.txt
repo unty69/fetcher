@@ -1,0 +1,5 @@
+telethon
+requests
+openpyxl
+python-dotenv
+playwright

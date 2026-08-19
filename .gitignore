@@ -1,0 +1,24 @@
+# Secrets / credentials
+.env
+*.session
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Claude local settings
+.claude/
+**/.claude/
+
+# Cache
+cache/*
+!cache/src/
+!cache/src/fetch_quickhire.py
+
+# Generated data / dumps
+*.jsonl
+output/
+
+# Temporary / backup files
+*.bak
+probe_report.txt
