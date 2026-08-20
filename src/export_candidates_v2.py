@@ -11,8 +11,13 @@ Excludes all 135 canonical_id already present in the root ground-truth
 workbook (any вердикт, including the blank row), then applies:
 
   HARD excludes (cleared by validate_v2.py: 0 false positives on both known
-  web identities) -- has_military_flag, has_agency_self_id, empty categories
-  (full message text, not sample_titles/title_of()).
+  web identities) -- has_military_flag, has_agency_self_id, NOT
+  has_verified_relevant_message (category AND a CPA-verified employer brand
+  matched on the SAME message text -- fixes an earlier identity-level union
+  bug where categories and brands were each accumulated independently across
+  ALL of an identity's messages, so a category from one message and a brand
+  from a completely unrelated message could combine into a false "relevant"
+  signal with no real co-occurrence).
 
   SOFT signals only, used for ranking, never for exclusion -- employer_count
   (bucketed per the CLAUDE.md hypothesis: 2-3 up, 0 neutral, 1 or 4+ down;
@@ -47,6 +52,10 @@ sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import alt_cluster_review as acr  # noqa: E402
+import validate_v2 as v2  # noqa: E402 -- reuse collect_debug_evidence() for the
+                           # has_verified_relevant_message co-occurrence examples
+                           # needed in the sample-rows report below (single source
+                           # of truth for the debug-snippet logic, not duplicated)
 
 GROUND_TRUTH_PATH = BASE_DIR / "alt_clusters_review.xlsx"
 OUTPUT_MAIN = BASE_DIR / "output" / "candidates_v2_main.xlsx"
@@ -120,7 +129,11 @@ def main():
     print(f"[3] Export pool (alt-cluster minus already-reviewed): {len(export_pool)}")
 
     print("\nComputing evidence (full message text) for the export pool -- one pass over all dumps...")
-    evidence = acr.collect_evidence(export_pool, contact_to_canonical)
+    # v2.collect_debug_evidence() mirrors acr.collect_evidence() exactly (same
+    # regex objects/functions) but also captures verified_relevant_examples --
+    # the actual co-occurring (category, verified_brand, title) per identity,
+    # needed for the sample-rows report below.
+    evidence = v2.collect_debug_evidence(export_pool, contact_to_canonical)
 
     # --- report content_volume_flag / soft-signal distributions on the RAW
     # ~7047 population, before any hard exclusion (what was asked for) ---
@@ -153,25 +166,28 @@ def main():
 
     # --- hard excludes ---
     print("\n" + "=" * 78)
-    print("Hard excludes (validated in Step 3: 0 false positives on known web)")
+    print("Hard excludes (co-occurrence-fixed gate; re-validated: 0 false positives on known web)")
     print("=" * 78)
     mil = {cid for cid in export_pool if evidence[cid]["has_military_flag"]}
     ag = {cid for cid in export_pool if evidence[cid]["has_agency_self_id"]}
-    empty_cat = {cid for cid in export_pool if len(evidence[cid]["categories"]) == 0}
-    excluded = mil | ag | empty_cat
-    print(f"has_military_flag=True:        {len(mil)}")
-    print(f"has_agency_self_id=True:       {len(ag)}")
-    print(f"categories empty (full text):  {len(empty_cat)}")
-    print(f"  overlap military & agency:        {len(mil & ag)}")
-    print(f"  overlap military & empty_cat:     {len(mil & empty_cat)}")
-    print(f"  overlap agency & empty_cat:        {len(ag & empty_cat)}")
-    print(f"  overlap all three:                 {len(mil & ag & empty_cat)}")
-    print(f"Union excluded (any of the three):    {len(excluded)}")
+    not_verified = {cid for cid in export_pool if not evidence[cid]["has_verified_relevant_message"]}
+    excluded = mil | ag | not_verified
+    print(f"has_military_flag=True:                 {len(mil)}")
+    print(f"has_agency_self_id=True:                {len(ag)}")
+    print(f"NOT has_verified_relevant_message:      {len(not_verified)}")
+    print(f"  overlap military & agency:                {len(mil & ag)}")
+    print(f"  overlap military & not_verified:          {len(mil & not_verified)}")
+    print(f"  overlap agency & not_verified:             {len(ag & not_verified)}")
+    print(f"  overlap all three:                         {len(mil & ag & not_verified)}")
+    print(f"Union excluded (any of the three):          {len(excluded)}")
 
     survivors = export_pool - excluded
     print(f"\nSurviving after hard excludes: {len(survivors)}")
-    print("NOTE: employer_count is explicitly NOT required > 0, and does NOT rescue an "
-          "empty-category identity -- category gate stands alone (the 'Яндекс ищет менеджера' trap).")
+    print("NOTE: employer_count (raw brand-match count) is explicitly NOT required > 0 on its own, "
+          "and does NOT independently rescue an identity that fails the gate -- the gate itself "
+          "already requires a CPA-verified employer brand to co-occur with a category on the SAME "
+          "message (the 'Яндекс ищет менеджера' trap: a bare category or bare employer match, or "
+          "both from different messages, is not enough).")
 
     # --- soft scoring on survivors only ---
     print("\n" + "=" * 78)
@@ -245,6 +261,28 @@ def main():
     print(f"  main (score > {split_median}):        {len(main_ids)}")
     print(f"  borderline (score <= {split_median}, still > {THRESHOLD}): {len(borderline_ids)}")
 
+    # --- sample rows: show the actual co-occurring evidence, not just counts ---
+    print("\n" + "=" * 78)
+    print("Sample survivor rows (category + CPA-verified employer that co-occurred on the SAME message)")
+    print("=" * 78)
+    sample_cids = sorted(main_ids, key=lambda c: -scores[c])[:20]
+    for i, cid in enumerate(sample_cids, 1):
+        ev = evidence[cid]
+        ex = ev["verified_relevant_examples"][0] if ev["verified_relevant_examples"] else None
+        title_preview = (ev["titles"][0][:100] if ev["titles"] else "")
+        print(f"\n{i}. {cid}  score={scores[cid]}")
+        print(f"   brands={sorted(ev['brands'])}  categories={sorted(ev['categories'])}")
+        if ex:
+            cats, verified_brands, ex_title = ex
+            print(f"   CO-OCCURRED: categories={cats} + verified_brands={verified_brands}")
+            print(f"   in message: \"{ex_title[:150]}\"")
+        else:
+            print(f"   !!! no verified_relevant_examples captured (unexpected -- should be non-empty "
+                  f"for anything in main_ids/survivors)")
+        print(f"   sample_title: \"{title_preview}\"")
+    print(f"\n(showing top {len(sample_cids)} of {len(main_ids)} main-batch rows by score, for eyeballing "
+          f"that white-collar/off-target noise like 'Менеджер по продажам' is actually gone)")
+
     # --- AC-4, now genuinely measurable on the main batch ---
     print("\n" + "=" * 78)
     print("AC-4: Content Sufficiency (now measured -- this population did not exist before Step 4)")
@@ -263,13 +301,14 @@ def main():
     FIELDNAMES = ["вердикт", "canonical_id", "score", "usernames", "phones", "corp_domain",
                   "hr_hint", "has_ref_link", "brands", "employer_count", "multibrand",
                   "categories", "has_military_flag", "has_agency_self_id", "content_volume_flag",
-                  "channel_count", "message_count", "first_seen", "last_seen", "sample_titles",
-                  "channels", "channel_links"]
+                  "has_verified_relevant_message", "channel_count", "message_count", "first_seen",
+                  "last_seen", "sample_titles", "channels", "channel_links"]
     COLUMN_WIDTHS = {
         "вердикт": 14, "canonical_id": 14, "score": 8, "usernames": 45, "phones": 35,
         "corp_domain": 12, "hr_hint": 10, "has_ref_link": 13, "brands": 35,
         "employer_count": 14, "multibrand": 12, "categories": 40,
         "has_military_flag": 16, "has_agency_self_id": 18, "content_volume_flag": 18,
+        "has_verified_relevant_message": 22,
         "channel_count": 14, "message_count": 14, "first_seen": 18, "last_seen": 18,
         "sample_titles": 80, "channels": 55, "channel_links": 60,
     }
@@ -296,6 +335,7 @@ def main():
             "has_military_flag": ev["has_military_flag"],
             "has_agency_self_id": ev["has_agency_self_id"],
             "content_volume_flag": ev["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS,
+            "has_verified_relevant_message": ev["has_verified_relevant_message"],
             "channel_count": len(channels_list),
             "message_count": ident["message_count"],
             "first_seen": acr.parse_dt(ident["first_seen"]),

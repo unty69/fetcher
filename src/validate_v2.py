@@ -70,6 +70,9 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
             "has_military_flag": False, "has_agency_self_id": False,
             "categories": set(), "max_text_len": 0,
             "military_hits": [], "agency_hits": [],
+            "has_verified_relevant_message": False,
+            "category_hit_messages": [], "verified_brand_hit_messages": [],
+            "verified_relevant_examples": [],
         }
         for cid in candidate_ids
     }
@@ -101,6 +104,11 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
         matched_categories = {cat for cat, pat in acr.CATEGORY_PATTERNS.items() if pat.search(text)}
         text_len = len(text.strip())
 
+        # Same fix as alt_cluster_review.collect_evidence(): co-occurrence on
+        # THIS message, not a union of independently-accumulated sets.
+        verified_brands_this_msg = brands & acr.CPA_VERIFIED_EMPLOYERS
+        msg_verified_relevant = bool(matched_categories) and bool(verified_brands_this_msg)
+
         for cid in matched_cids:
             ev = evidence[cid]
             ev["brands"] |= brands
@@ -118,6 +126,21 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
                 if len(ev["agency_hits"]) < 2:
                     ev["agency_hits"].append((agency_match.group(0), title))
             ev["categories"] |= matched_categories
+            ev["has_verified_relevant_message"] = ev["has_verified_relevant_message"] or msg_verified_relevant
+            # Diagnostic only (not used by production code): track messages
+            # that had a category match, and separately messages that had a
+            # verified-brand match, even when they didn't co-occur -- so a
+            # failed AC-1 check can show exactly what was missing instead of
+            # just "False".
+            if matched_categories and len(ev["category_hit_messages"]) < 3:
+                ev["category_hit_messages"].append((sorted(matched_categories), title))
+            if verified_brands_this_msg and len(ev["verified_brand_hit_messages"]) < 3:
+                ev["verified_brand_hit_messages"].append((sorted(verified_brands_this_msg), title))
+            # The actual co-occurrence instance (both together, same message) --
+            # used by export_candidates_v2.py's sample-rows report.
+            if msg_verified_relevant and len(ev["verified_relevant_examples"]) < 2:
+                ev["verified_relevant_examples"].append(
+                    (sorted(matched_categories), sorted(verified_brands_this_msg), title))
             if text_len > ev["max_text_len"]:
                 ev["max_text_len"] = text_len
 
@@ -194,6 +217,12 @@ def main():
     content_counts = print_rule(f"content_volume_flag (max_text_len >= {acr.CONTENT_VOLUME_MIN_CHARS} chars, "
                                  f"PROVISIONAL threshold)",
                                  lambda cid: evidence[cid]["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS)
+    verified_counts = print_rule("has_verified_relevant_message (category AND CPA-verified employer, "
+                                  "SAME message -- fixes the identity-level union bug)",
+                                  lambda cid: evidence[cid]["has_verified_relevant_message"])
+    print("\n  (for comparison, the OLD buggy rule this replaces as the export hard-exclude gate:)")
+    old_buggy_counts = print_rule("[OLD/BUGGY] categories non-empty (identity-level union, no co-occurrence)",
+                                   lambda cid: len(evidence[cid]["categories"]) > 0)
     print("\n-- existing weak signals (informational only, unchanged by this task) --")
     ref_link_counts = print_rule("has_ref_link", lambda cid: evidence[cid]["has_ref_link"])
     corp_counts = print_rule("corp_domain", lambda cid: acr.has_corp_domain(identities[cid]))
@@ -244,16 +273,17 @@ def main():
         print(f"  {LABEL_EN[lbl]}: {total - hits}/{total} low-content")
 
     print("\n" + "=" * 78)
-    print("Confusion matrix: label vs candidate-hard-exclusion-signal-fired")
+    print("Confusion matrix: label vs actual export hard-exclusion gate")
     print("=" * 78)
-    print("(NOTHING is hard-filtered by this implementation yet -- shows what WOULD be excluded")
-    print(" if has_military_flag OR has_agency_self_id became a hard filter, per CLAUDE.md's")
-    print(" 'measure first, filter later' instruction)")
-    print(f"\n{'label':<14}{'signal_fired':>14}{'no_signal':>12}{'total':>8}")
+    print("gate = has_military_flag OR has_agency_self_id OR NOT has_verified_relevant_message")
+    print("(this is now the real export_candidates_v2.py gate, not a hypothetical preview)")
+    print(f"\n{'label':<14}{'excluded':>14}{'would_export':>14}{'total':>8}")
     for lbl in LABELS:
         cids = [cid for cid, v in labeled if v == lbl]
-        fired = sum(1 for cid in cids if evidence[cid]["has_military_flag"] or evidence[cid]["has_agency_self_id"])
-        print(f"{LABEL_EN[lbl]:<14}{fired:>14}{len(cids) - fired:>12}{len(cids):>8}")
+        excluded_n = sum(1 for cid in cids if evidence[cid]["has_military_flag"]
+                          or evidence[cid]["has_agency_self_id"]
+                          or not evidence[cid]["has_verified_relevant_message"])
+        print(f"{LABEL_EN[lbl]:<14}{excluded_n:>14}{len(cids) - excluded_n:>14}{len(cids):>8}")
 
     print("\n" + "=" * 78)
     print("Concrete false-positive catches (non-web identities newly flaggable)")
@@ -268,11 +298,48 @@ def main():
             reasons.append(f"military hit={ev['military_hits']}")
         if ev["has_agency_self_id"]:
             reasons.append(f"agency_self_id hit={ev['agency_hits']}")
+        if not ev["has_verified_relevant_message"]:
+            reasons.append("NOT has_verified_relevant_message "
+                            f"(categories(union)={sorted(ev['categories'])}, "
+                            f"verified_brands(union)={sorted(ev['brands'] & acr.CPA_VERIFIED_EMPLOYERS)})")
         if reasons:
             catches.append((cid, v, reasons))
-    print(f"Total identities newly flagged by military OR agency_self_id (label != веб): {len(catches)}")
-    for cid, v, reasons in catches:
+    print(f"Total identities newly flagged by military OR agency_self_id OR NOT has_verified_relevant_message "
+          f"(label != веб): {len(catches)} / {len(labeled) - len(web_cids)}")
+    print("(first 15 shown; full gate applied at scale in export_candidates_v2.py)")
+    for cid, v, reasons in catches[:15]:
         print(f"  {cid} | old_classification={LABEL_EN[v]}({v}) | new_signal: {' ; '.join(reasons)}")
+
+    print("\n" + "=" * 78)
+    print("has_verified_relevant_message check on known web identities (export hard-exclude gate)")
+    print("=" * 78)
+    print("Required before any new export: both known web canonical_ids must have")
+    print("has_verified_relevant_message=True. If not, STOP and report the missing")
+    print("message/employer/category combination -- do not loosen the rule to force a pass.")
+    verified_gate_failures = []
+    for cid in web_cids:
+        v = evidence[cid]["has_verified_relevant_message"]
+        print(f"\n  {cid}: has_verified_relevant_message={v}")
+        if v:
+            print(f"    (co-occurrence confirmed on >=1 message)")
+        else:
+            verified_gate_failures.append(cid)
+            print(f"    !!! MISSING. Diagnostic -- what WAS found, just never together:")
+            print(f"    category matches (any message, unioned): {sorted(evidence[cid]['categories'])}")
+            print(f"    category-match sample messages: {evidence[cid]['category_hit_messages']}")
+            print(f"    CPA-verified brand matches (any message, unioned): "
+                  f"{sorted(evidence[cid]['brands'] & acr.CPA_VERIFIED_EMPLOYERS)}")
+            print(f"    verified-brand-match sample messages: {evidence[cid]['verified_brand_hit_messages']}")
+            print(f"    all brands (incl. non-CPA-verified): {sorted(evidence[cid]['brands'])}")
+
+    if verified_gate_failures:
+        print(f"\n!!! STOPPING: {len(verified_gate_failures)}/{len(web_cids)} known web identities would be "
+              f"lost by the new has_verified_relevant_message export gate: {verified_gate_failures}")
+        print("!!! Per instruction: not loosening the rule to force a pass. Fix requires investigating")
+        print("!!! the specific message/employer/category gap shown above before any export proceeds.")
+        sys.exit(1)
+    print(f"\nAll {len(web_cids)}/{len(web_cids)} known web identities have has_verified_relevant_message=True. "
+          f"Safe to proceed to export with the new gate.")
 
     print("\n" + "=" * 78)
     print("Known-web preservation / AC-1")

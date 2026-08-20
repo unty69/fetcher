@@ -80,6 +80,30 @@ EMPLOYERS = {
     "СДЭК": r"\bСДЭК\b", "Мегафон": r"МегаФон|Мегафон", "InHome": r"\bInHome\b",
 }
 
+# Small explicitly-marked subset of EMPLOYERS: employers CONFIRMED to have a
+# real CPA/affiliate offer on a competing platform, not just brand-recognized
+# in text. Used by alt_cluster_review.py's has_verified_relevant_message gate
+# (category match AND a verified-employer brand match on the SAME message).
+#
+# Two names from the source list didn't map onto EMPLOYERS as literal keys --
+# resolved explicitly rather than assumed:
+#   "Магнит" is not a key (EMPLOYERS only has the two sub-brands below) -- both
+#   included, no basis to prefer one over the other.
+#   "СберМаркет" is not a separate key -- it's already an alternate pattern
+#   under "Купер" (r"\bКупер\b|Сбермаркет|СберМаркет|SberMarket", same
+#   company post-rebrand). Adding a second "СберМаркет" key would duplicate an
+#   existing entry, which CLAUDE.md's employer-dictionary rule forbids.
+#   "Купер" is included here instead so the intent (mark that offer verified)
+#   still holds.
+CPA_VERIFIED_EMPLOYERS = {
+    "VOXYS", "ОНЕКТА", "Дикси", "Яндекс Еда", "ROSTIC'S", "Восток Запад Логистика",
+    "Самокат", "Магнит Заряд", "Магнит доставка", "Ozon", "X5 Доставка", "Альфа-Банк",
+    "Яндекс Маркет", "Efin", "4 Лапы", "ВТБ", "Клин Лабс", "Burger King", "МТС",
+    "Яндекс Лавка", "Домовёнок", "Достависта", "Тетрика", "lamoda", "Купер",
+}
+assert CPA_VERIFIED_EMPLOYERS <= set(EMPLOYERS), \
+    f"CPA_VERIFIED_EMPLOYERS has entries not in EMPLOYERS: {CPA_VERIFIED_EMPLOYERS - set(EMPLOYERS)}"
+
 CORP_DOMAINS = {
     "Ozon": ("ozon.ru",), "Т-Банк": ("tbank.ru", "tinkoff.ru"),
     "HeadHunter": ("hh.ru", "headhunter.ru"), "Яндекс Маркет": ("yandex.ru", "yandex-team.ru"),

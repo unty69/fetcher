@@ -27,7 +27,9 @@ from openpyxl.worksheet.datavalidation import DataValidation  # noqa: E402
 
 import build  # noqa: E402
 from identity_graph import iter_dump_paths, load_messages, message_contact_nodes  # noqa: E402
-from search_employers import EMPLOYERS, category_patterns as CATEGORY_PATTERNS  # noqa: E402
+from search_employers import (  # noqa: E402
+    EMPLOYERS, category_patterns as CATEGORY_PATTERNS, CPA_VERIFIED_EMPLOYERS,
+)
 
 IDENTITY_GRAPH_PATH = BASE_DIR / "cache" / "identity_graph.json"
 OUTPUT_XLSX = BASE_DIR / "output" / "alt_clusters_review.xlsx"
@@ -125,6 +127,7 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
             "brands": set(), "has_ref_link": False, "titles": [],
             "has_military_flag": False, "has_agency_self_id": False,
             "categories": set(), "max_text_len": 0,
+            "has_verified_relevant_message": False,
         }
         for cid in candidate_ids
     }
@@ -160,6 +163,16 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
         matched_categories = {cat for cat, pat in CATEGORY_PATTERNS.items() if pat.search(text)}
         text_len = len(text.strip())
 
+        # Message-level co-occurrence, NOT identity-level union: category and
+        # CPA-verified employer must both match on THIS SAME message text.
+        # brands/categories below are still unioned across an identity's
+        # messages (soft signals, unchanged) -- that union is exactly what
+        # let "categories non-empty" and "brands non-empty" come from two
+        # unrelated messages with no actual co-occurrence. This flag fixes
+        # that by checking both conditions before the per-message data is
+        # folded into the identity-level union.
+        msg_verified_relevant = bool(matched_categories) and bool(brands & CPA_VERIFIED_EMPLOYERS)
+
         for cid in matched_cids:
             ev = evidence[cid]
             ev["brands"] |= brands
@@ -169,6 +182,7 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
             ev["has_military_flag"] = ev["has_military_flag"] or is_military
             ev["has_agency_self_id"] = ev["has_agency_self_id"] or is_agency_self_id
             ev["categories"] |= matched_categories
+            ev["has_verified_relevant_message"] = ev["has_verified_relevant_message"] or msg_verified_relevant
             if text_len > ev["max_text_len"]:
                 ev["max_text_len"] = text_len
 
@@ -219,6 +233,7 @@ def build_rows(candidates: dict, evidence: dict):
             "has_agency_self_id": ev["has_agency_self_id"],
             "categories": ", ".join(categories),
             "content_volume_flag": ev["max_text_len"] >= CONTENT_VOLUME_MIN_CHARS,
+            "has_verified_relevant_message": ev["has_verified_relevant_message"],
         })
 
     rows.sort(key=lambda r: (
@@ -238,7 +253,7 @@ FIELDNAMES = ["вердикт", "canonical_id", "usernames", "phones", "corp_dom
               "has_ref_link", "brands", "multibrand", "channel_count", "message_count",
               "first_seen", "last_seen", "sample_titles", "channels", "channel_links",
               "employer_count", "has_military_flag", "has_agency_self_id", "categories",
-              "content_volume_flag"]
+              "content_volume_flag", "has_verified_relevant_message"]
 
 COLUMN_WIDTHS = {
     "вердикт": 14, "canonical_id": 14, "usernames": 45, "phones": 35,
@@ -247,7 +262,7 @@ COLUMN_WIDTHS = {
     "first_seen": 18, "last_seen": 18, "sample_titles": 80,
     "channels": 55, "channel_links": 60,
     "employer_count": 14, "has_military_flag": 16, "has_agency_self_id": 18,
-    "categories": 40, "content_volume_flag": 18,
+    "categories": 40, "content_volume_flag": 18, "has_verified_relevant_message": 22,
 }
 
 
