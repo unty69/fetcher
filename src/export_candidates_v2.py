@@ -21,17 +21,37 @@ workbook (any вердикт, including the blank row), then applies:
 
   SOFT signals only, used for ranking, never for exclusion -- employer_count
   (bucketed per the CLAUDE.md hypothesis: 2-3 up, 0 neutral, 1 or 4+ down;
-  still unconfirmed at scale), content_volume_flag, has_ref_link, corp_domain,
-  channel_count, message_count (channel/message count bucketed by tertiles
-  computed on the actual surviving population, not guessed cut points).
+  still unconfirmed at scale), content_volume_flag, has_ref_link, channel_count
+  and message_count (NON-monotonic tertile buckets computed on the actual
+  surviving population: bottom neutral, middle the positive peak, top
+  NEGATIVE -- same shape as employer_count, not the old top-is-best mapping;
+  concrete motivation: a 5-category aggregator-pattern identity with high
+  channel/message count previously outscored a clean single-vertical,
+  verified courier identity specifically because of its modest channel/
+  message count), category_count (new -- penalizes category dispersion above
+  the survivor population's top-tertile boundary; manual observation was
+  "4+ categories looks like aggregator noise", checked against the actual
+  distribution, not hardcoded), address_location_count (new -- distinct
+  street/metro/mall/bare-address matches across an identity's messages,
+  deduped so the same address repeated across near-duplicate reposts doesn't
+  inflate the count; penalizes above the top-tertile boundary; validated
+  against real message text before use -- see validate_v2.py's
+  ADDRESS_PATTERNS and the conversation record for the false-positive check).
+
+  corp_domain is NOT part of the additive score -- it is a direct
+  main-eligibility GATE: corp_domain=True identities are excluded from
+  candidates_v2_main.xlsx regardless of score, but still land in
+  candidates_v2_borderline.xlsx if they clear the export threshold (not
+  hard-excluded from the export entirely).
 
 Threshold: score > 0 (net positive evidence over negative) -- the natural
 zero-crossing of a signed additive score, not a percentile picked to hit a
 row-count target. Main/borderline split is by score-threshold PROXIMITY
-(median split of the exported population), not by content_volume_flag --
-that flag is boolean (see report) and CLAUDE.md instructs falling back to
-score-proximity for the split when it's boolean rather than tri-state.
-content_volume_flag still feeds the score itself as one soft input.
+(median split of the corp_domain=False exported population), not by
+content_volume_flag -- that flag is boolean (see report) and CLAUDE.md
+instructs falling back to score-proximity for the split when it's boolean
+rather than tri-state. content_volume_flag still feeds the score itself as
+one soft input.
 
 Writes output/candidates_v2_main.xlsx and output/candidates_v2_borderline.xlsx.
 Neither is committed (see .gitignore -- output/ is already ignored).
@@ -39,6 +59,7 @@ Never writes to cache/, never touches the ground-truth workbook (read_only).
 """
 import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -89,12 +110,15 @@ def employer_bucket_score(employer_count):
 
 
 def tertile_bucketer(values):
-    """Returns a function mapping a value to 0/1/2 by tertile of the ACTUAL
-    surviving population -- not a guessed cut point. Falls back to constant
-    0 if the population is too small/uniform for statistics.quantiles."""
+    """Returns (bucket_fn, q1, q2) -- bucket_fn maps a value to 0/1/2 by
+    tertile of the ACTUAL surviving population, not a guessed cut point.
+    Degenerate case (population too small/uniform for statistics.quantiles)
+    falls back to a constant-0 bucket_fn with q1=q2=the single value --
+    ALWAYS a 3-tuple, so callers never need a special-cased unpack."""
     clean = sorted(v for v in values if v is not None)
     if len(clean) < 3 or clean[0] == clean[-1]:
-        return lambda x: 0
+        only = clean[0] if clean else 0
+        return (lambda x: 0), only, only
     q1, q2 = statistics.quantiles(clean, n=3)
 
     def bucket(x):
@@ -105,6 +129,17 @@ def tertile_bucketer(values):
         return 0
 
     return bucket, q1, q2
+
+
+def nonmonotonic_bucket_score(bucket_idx):
+    """Same shape as employer_bucket_score: bottom tertile neutral, middle
+    tertile the positive peak, top tertile negative. Used for channel_count/
+    message_count -- concrete motivation (see conversation record): the
+    previous monotonic mapping let a 5-category, high-channel/message-count
+    aggregator-pattern identity outscore a clean single-vertical, verified
+    courier identity specifically because of the courier's modest channel/
+    message count. High volume alone is no longer treated as purely good."""
+    return {0: 0, 1: 2, 2: -1}[bucket_idx]
 
 
 def main():
@@ -207,26 +242,54 @@ def main():
     print(f"message_count tertile cut points (from actual survivor distribution): "
           f"q1={msg_q1:.1f} q2={msg_q2:.1f}")
 
-    # --- score ---
+    # --- category_count / address_location_count: new negative soft signals,
+    # thresholds derived from the ACTUAL survivor distribution (top-tertile
+    # boundary), not hardcoded ---
+    category_counts = {cid: len(evidence[cid]["categories"]) for cid in survivors}
+    address_counts = {cid: len(evidence[cid]["address_matches"]) for cid in survivors}
+    _, cat_q1, cat_q2 = tertile_bucketer(category_counts.values())
+    _, addr_q1, addr_q2 = tertile_bucketer(address_counts.values())
+
+    print(f"\ncategory_count distribution: " +
+          ", ".join(f"{k}:{v}" for k, v in sorted(Counter(category_counts.values()).items())))
+    print(f"category_count top-tertile boundary (q2) = {cat_q2:.2f} -- "
+          f"penalize category_count > {cat_q2:.2f}")
+    print(f"(manual observation was '4+ categories looks like aggregator noise' -- "
+          f"{'MATCHES' if round(cat_q2) in (3, 4) else 'DIVERGES FROM'} the empirical top-tertile "
+          f"boundary, using the empirical value either way)")
+
+    print(f"\naddress_location_count distribution: " +
+          ", ".join(f"{k}:{v}" for k, v in sorted(Counter(address_counts.values()).items())))
+    print(f"address_location_count top-tertile boundary (q2) = {addr_q2:.2f} -- "
+          f"penalize address_location_count > {addr_q2:.2f}")
+
+    # --- corp_domain: main-eligibility GATE, not an additive score term ---
+    corp_domain_flags = {cid: acr.has_corp_domain(identities[cid]) for cid in survivors}
+    print(f"\ncorp_domain=True among survivors: {sum(corp_domain_flags.values())}/{len(survivors)} "
+          f"-- these can still be exported/borderline, just never main, regardless of score.")
+
+    # --- score (corp_domain removed -- see gate above) ---
     print("\nScore formula (additive integer, deterministic, all inputs SOFT per instruction):")
     print("  employer_count bucket: 2-3 -> +2, 0 -> 0, 1 or 4+ -> -1  (CLAUDE.md hypothesis, unconfirmed)")
     print("  content_volume_flag:   True -> +1, False -> 0")
     print("  has_ref_link:          True -> +1, False -> 0")
-    print("  corp_domain:           True -> -1, False -> 0  (mirrors existing sort direction)")
-    print("  channel_count tertile:  top -> +2, mid -> +1, bottom -> 0")
-    print("  message_count tertile:  top -> +2, mid -> +1, bottom -> 0")
+    print("  channel_count tertile:  bottom -> 0, mid -> +2, top -> -1  (NON-monotonic, was top->+2)")
+    print("  message_count tertile:  bottom -> 0, mid -> +2, top -> -1  (NON-monotonic, was top->+2)")
+    print(f"  category_count:         > {cat_q2:.2f} -> -1, else 0  (NEW)")
+    print(f"  address_location_count: > {addr_q2:.2f} -> -1, else 0  (NEW)")
+    print("  corp_domain:            REMOVED from score -- now a direct main-eligibility gate (see below)")
 
     scores = {}
     for cid in survivors:
         ev = evidence[cid]
-        ident = identities[cid]
         s = 0
         s += employer_bucket_score(len(ev["brands"]))
         s += 1 if ev["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS else 0
         s += 1 if ev["has_ref_link"] else 0
-        s += -1 if acr.has_corp_domain(ident) else 0
-        s += ch_bucket(channel_counts[cid])
-        s += msg_bucket(message_counts[cid])
+        s += nonmonotonic_bucket_score(ch_bucket(channel_counts[cid]))
+        s += nonmonotonic_bucket_score(msg_bucket(message_counts[cid]))
+        s += -1 if category_counts[cid] > cat_q2 else 0
+        s += -1 if address_counts[cid] > addr_q2 else 0
         scores[cid] = s
 
     score_values = sorted(scores.values())
@@ -235,43 +298,61 @@ def main():
               f"min={score_values[0]} p25={statistics.quantiles(score_values, n=4)[0]:.1f} "
               f"median={statistics.median(score_values):.1f} "
               f"p75={statistics.quantiles(score_values, n=4)[2]:.1f} max={score_values[-1]}")
-        from collections import Counter
         hist = Counter(score_values)
         print("Full histogram (score: count): " +
               ", ".join(f"{k}:{v}" for k, v in sorted(hist.items())))
 
     # --- threshold: score > 0 (net positive evidence), the natural
     # zero-crossing of a signed additive score -- not a percentile chosen to
-    # hit a target row count ---
+    # hit a target row count. Unchanged by the corp_domain gate below (that
+    # gate only affects WHICH bucket -- main vs borderline -- not whether an
+    # identity is exported at all). ---
     THRESHOLD = 0
     exported = {cid: s for cid, s in scores.items() if s > THRESHOLD}
     print(f"\nThreshold: score > {THRESHOLD} (net positive soft evidence). "
           f"Exported: {len(exported)}/{len(survivors)}")
 
+    # corp_domain=True identities are excluded from main REGARDLESS of score
+    # (a split-eligibility gate, not a score term) -- they still land in
+    # borderline if they clear the export threshold. The main/borderline
+    # median split is computed only over corp_domain=False exported
+    # identities, since corp_domain=True identities are never main candidates
+    # and shouldn't skew where that boundary falls.
+    eligible_for_main = {cid: s for cid, s in exported.items() if not corp_domain_flags[cid]}
+    forced_borderline = {cid: s for cid, s in exported.items() if corp_domain_flags[cid]}
+    print(f"Of the {len(exported)} exported, {len(forced_borderline)} have corp_domain=True and are "
+          f"forced to borderline regardless of score; {len(eligible_for_main)} are eligible for main.")
+
     # main/borderline split by score-threshold PROXIMITY (median split),
     # NOT by content_volume_flag -- see module docstring / report.
-    if exported:
-        exp_scores_sorted = sorted(exported.values())
-        split_median = statistics.median(exp_scores_sorted)
+    if eligible_for_main:
+        split_median = statistics.median(sorted(eligible_for_main.values()))
     else:
         split_median = 0
-    main_ids = {cid for cid, s in exported.items() if s > split_median}
-    borderline_ids = {cid for cid, s in exported.items() if s <= split_median}
-    print(f"Main/borderline split at median score ({split_median}) of the exported population:")
-    print(f"  main (score > {split_median}):        {len(main_ids)}")
-    print(f"  borderline (score <= {split_median}, still > {THRESHOLD}): {len(borderline_ids)}")
+    main_ids = {cid for cid, s in eligible_for_main.items() if s > split_median}
+    borderline_ids = ({cid for cid, s in eligible_for_main.items() if s <= split_median}
+                       | set(forced_borderline.keys()))
+    print(f"Main/borderline split at median score ({split_median}) of the corp_domain=False "
+          f"exported population:")
+    print(f"  main (corp_domain=False, score > {split_median}):        {len(main_ids)}")
+    print(f"  borderline (corp_domain=True, OR corp_domain=False with score <= {split_median}): "
+          f"{len(borderline_ids)}")
 
-    # --- sample rows: show the actual co-occurring evidence, not just counts ---
+    # --- FULL main batch, not samples -- requested explicitly this round ---
     print("\n" + "=" * 78)
-    print("Sample survivor rows (category + CPA-verified employer that co-occurred on the SAME message)")
+    print(f"FULL main batch ({len(main_ids)} rows) -- category + CPA-verified employer "
+          f"co-occurrence, corp_domain, category/address counts")
     print("=" * 78)
-    sample_cids = sorted(main_ids, key=lambda c: -scores[c])[:20]
-    for i, cid in enumerate(sample_cids, 1):
+    all_main_sorted = sorted(main_ids, key=lambda c: -scores[c])
+    for i, cid in enumerate(all_main_sorted, 1):
         ev = evidence[cid]
         ex = ev["verified_relevant_examples"][0] if ev["verified_relevant_examples"] else None
-        title_preview = (ev["titles"][0][:100] if ev["titles"] else "")
-        print(f"\n{i}. {cid}  score={scores[cid]}")
+        print(f"\n{i}. {cid}  score={scores[cid]}  "
+              f"category_count={category_counts[cid]}  address_location_count={address_counts[cid]}  "
+              f"channel_count={channel_counts[cid]}  message_count={message_counts[cid]}")
         print(f"   brands={sorted(ev['brands'])}  categories={sorted(ev['categories'])}")
+        if ev["address_matches"]:
+            print(f"   address_matches={sorted(ev['address_matches'])}")
         if ex:
             cats, verified_brands, ex_title = ex
             print(f"   CO-OCCURRED: categories={cats} + verified_brands={verified_brands}")
@@ -279,9 +360,8 @@ def main():
         else:
             print(f"   !!! no verified_relevant_examples captured (unexpected -- should be non-empty "
                   f"for anything in main_ids/survivors)")
-        print(f"   sample_title: \"{title_preview}\"")
-    print(f"\n(showing top {len(sample_cids)} of {len(main_ids)} main-batch rows by score, for eyeballing "
-          f"that white-collar/off-target noise like 'Менеджер по продажам' is actually gone)")
+    print(f"\n(full {len(main_ids)}-row main batch shown above; borderline is {len(borderline_ids)} "
+          f"rows, not printed inline)")
 
     # --- AC-4, now genuinely measurable on the main batch ---
     print("\n" + "=" * 78)
@@ -300,15 +380,16 @@ def main():
     # --- write output files ---
     FIELDNAMES = ["вердикт", "canonical_id", "score", "usernames", "phones", "corp_domain",
                   "hr_hint", "has_ref_link", "brands", "employer_count", "multibrand",
-                  "categories", "has_military_flag", "has_agency_self_id", "content_volume_flag",
-                  "has_verified_relevant_message", "channel_count", "message_count", "first_seen",
+                  "categories", "category_count", "has_military_flag", "has_agency_self_id",
+                  "content_volume_flag", "has_verified_relevant_message", "address_location_count",
+                  "address_matches", "channel_count", "message_count", "first_seen",
                   "last_seen", "sample_titles", "channels", "channel_links"]
     COLUMN_WIDTHS = {
         "вердикт": 14, "canonical_id": 14, "score": 8, "usernames": 45, "phones": 35,
         "corp_domain": 12, "hr_hint": 10, "has_ref_link": 13, "brands": 35,
-        "employer_count": 14, "multibrand": 12, "categories": 40,
+        "employer_count": 14, "multibrand": 12, "categories": 40, "category_count": 14,
         "has_military_flag": 16, "has_agency_self_id": 18, "content_volume_flag": 18,
-        "has_verified_relevant_message": 22,
+        "has_verified_relevant_message": 22, "address_location_count": 20, "address_matches": 60,
         "channel_count": 14, "message_count": 14, "first_seen": 18, "last_seen": 18,
         "sample_titles": 80, "channels": 55, "channel_links": 60,
     }
@@ -332,10 +413,13 @@ def main():
             "employer_count": len(brands),
             "multibrand": len(brands) >= 2,
             "categories": ", ".join(categories),
+            "category_count": len(categories),
             "has_military_flag": ev["has_military_flag"],
             "has_agency_self_id": ev["has_agency_self_id"],
             "content_volume_flag": ev["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS,
             "has_verified_relevant_message": ev["has_verified_relevant_message"],
+            "address_location_count": len(ev["address_matches"]),
+            "address_matches": ", ".join(f"{name}:{val}" for name, val in sorted(ev["address_matches"])),
             "channel_count": len(channels_list),
             "message_count": ident["message_count"],
             "first_seen": acr.parse_dt(ident["first_seen"]),

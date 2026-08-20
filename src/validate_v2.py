@@ -13,6 +13,8 @@ Read-only / deterministic:
   - no ML / no randomness -- same input always produces the same report
   - does not call alt_cluster_review.write_workbook() / main() (no export)
 """
+import re
+import statistics
 import sys
 from collections import Counter
 from pathlib import Path
@@ -33,6 +35,54 @@ GROUND_TRUTH_PATH = BASE_DIR / "alt_clusters_review.xlsx"
 
 LABELS = ["веб", "не_веб", "агентство", "не_уверен"]
 LABEL_EN = {"веб": "web", "не_веб": "non-web", "агентство": "agency", "не_уверен": "uncertain"}
+
+# Address/location patterns -- soft signal, distinct-count based (NOT boolean
+# "mentions a location") specifically because a genuine single job post can
+# legitimately name its one workplace once; only REPEATED distinct locations
+# across an identity's messages looks like aggregator behaviour. Validated
+# against real message text from the 134 labeled identities before use (see
+# conversation record): STREET/METRO/MALL showed 0 visible false positives
+# across ~109 samples. BARE (no street-type prefix) is the highest-risk one --
+# 2 real false positives found in 27 samples: a date range ("Петербург,
+# 18 - 21 июня" read as house number 18) and a brand-name list ("Сушивок, 2
+# берега" -- restaurant names, read as street+number). The date-range shape is
+# guarded against below; the brand-list shape is NOT (would need a full brand
+# dictionary cross-check to rule out generally) -- accepted as a known residual
+# risk, tolerable specifically because this is a distinct-count soft signal,
+# not a boolean or a hard filter, so one stray match rarely changes the count
+# enough to matter.
+STREET_ADDRESS_RE = re.compile(
+    r'\b(?:ул\.?|улица|пр-?т\.?|проспект|пер\.?|переулок|б-?р\.?|бульвар|ш\.?|шоссе|наб\.?|набережная)\s+'
+    r'[А-ЯЁ][а-яёА-Я\-]{2,25}',
+    re.IGNORECASE,
+)
+METRO_ADDRESS_RE = re.compile(
+    r'\b(?:ст\.?\s*м\.?|станция\s+метро|метро)\s+[А-ЯЁ][а-яёА-Я\-]{2,25}',
+    re.IGNORECASE,
+)
+MALL_ADDRESS_RE = re.compile(
+    r'\b(?:ТЦ|ТРЦ|ТРК|БЦ)\s*[«"]?\s*[А-ЯЁ][а-яёА-Я\- ]{1,30}[»"]?',
+)
+BARE_ADDRESS_RE = re.compile(
+    r'\b[А-ЯЁ][а-яё]{2,20},\s*\d{1,4}[а-яА-Я]?\b(?!\s*-\s*\d)',
+)
+ADDRESS_PATTERNS = {
+    "street": STREET_ADDRESS_RE, "metro": METRO_ADDRESS_RE,
+    "mall": MALL_ADDRESS_RE, "bare": BARE_ADDRESS_RE,
+}
+
+
+def address_matches_in_text(text):
+    """{(pattern_name, normalized_match_string)} -- normalized so the same
+    address repeated across many near-duplicate reposted messages (observed
+    in real data, e.g. the same "ул. Летчика..." address on ~7 messages)
+    counts once, not once per repost."""
+    found = set()
+    for name, pat in ADDRESS_PATTERNS.items():
+        for m in pat.finditer(text):
+            normalized = re.sub(r'\s+', ' ', m.group(0).strip().lower())
+            found.add((name, normalized))
+    return found
 
 
 def load_ground_truth():
@@ -73,6 +123,7 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
             "has_verified_relevant_message": False,
             "category_hit_messages": [], "verified_brand_hit_messages": [],
             "verified_relevant_examples": [],
+            "address_matches": set(),
         }
         for cid in candidate_ids
     }
@@ -108,6 +159,7 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
         # THIS message, not a union of independently-accumulated sets.
         verified_brands_this_msg = brands & acr.CPA_VERIFIED_EMPLOYERS
         msg_verified_relevant = bool(matched_categories) and bool(verified_brands_this_msg)
+        msg_address_matches = address_matches_in_text(text)
 
         for cid in matched_cids:
             ev = evidence[cid]
@@ -127,6 +179,7 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
                     ev["agency_hits"].append((agency_match.group(0), title))
             ev["categories"] |= matched_categories
             ev["has_verified_relevant_message"] = ev["has_verified_relevant_message"] or msg_verified_relevant
+            ev["address_matches"] |= msg_address_matches
             # Diagnostic only (not used by production code): track messages
             # that had a category match, and separately messages that had a
             # verified-brand match, even when they didn't co-occur -- so a
@@ -340,6 +393,35 @@ def main():
         sys.exit(1)
     print(f"\nAll {len(web_cids)}/{len(web_cids)} known web identities have has_verified_relevant_message=True. "
           f"Safe to proceed to export with the new gate.")
+
+    print("\n" + "=" * 78)
+    print("New scoring signals on known web identities (end-to-end re-confirmation)")
+    print("=" * 78)
+    for cid in web_cids:
+        ev = evidence[cid]
+        cat_count = len(ev["categories"])
+        addr_count = len(ev["address_matches"])
+        corp = acr.has_corp_domain(identities[cid])
+        print(f"\n  {cid}:")
+        print(f"    corp_domain={corp}  (main-eligibility gate -- must be False)")
+        print(f"    category_count={cat_count}  categories={sorted(ev['categories'])}")
+        print(f"    address_location_count={addr_count}  matches={sorted(ev['address_matches'])}")
+    print("\n  (category_count and address_location_count both feed the score as soft signals, not")
+    print("   gates -- shown here so a high value on either wouldn't go unnoticed before export)")
+
+    print("\n" + "=" * 78)
+    print("category_count / address_location_count distribution across the FULL labeled set")
+    print("=" * 78)
+    print("(diagnostic context, not the actual scoring population -- that's the export pool)")
+    for lbl in LABELS:
+        cids = [cid for cid, v in labeled if v == lbl]
+        if not cids:
+            continue
+        cat_counts = sorted(len(evidence[cid]["categories"]) for cid in cids)
+        addr_counts = sorted(len(evidence[cid]["address_matches"]) for cid in cids)
+        print(f"  {LABEL_EN[lbl]}: category_count min={cat_counts[0]} median={statistics.median(cat_counts):.1f} "
+              f"max={cat_counts[-1]}  |  address_location_count min={addr_counts[0]} "
+              f"median={statistics.median(addr_counts):.1f} max={addr_counts[-1]}")
 
     print("\n" + "=" * 78)
     print("Known-web preservation / AC-1")
