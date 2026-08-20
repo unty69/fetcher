@@ -72,6 +72,32 @@ ADDRESS_PATTERNS = {
 }
 
 
+# "Пункт выдачи заказов" / "ПВЗ" -- Арсений's instruction: single/few-person
+# points, not mass-hire targets. NOT itself a category-match term (verified:
+# no JOB_CATEGORY_KEYWORDS pattern contains "пункт" or "ПВЗ"). The reason PVZ
+# roles were showing up under "Курьеры и доставка" was confirmed on real
+# message text -- e.g. "Администратор в пункт выдачи ... Обязанности: Приём
+# товара ОТ КУРЬЕРА" -- the job description mentions "курьера" because the
+# role RECEIVES FROM couriers, not because it IS one. Full hard-exclude
+# (Арсений was explicit "нет массового набора"), not a soft signal.
+PVZ_RE = re.compile(r'пункт[а-я]*\s+выдач|\bПВЗ\b', re.IGNORECASE)
+
+# Off-target white-collar noise -- validated against real uncategorized
+# message titles from the 189-identity labeled set (see conversation record):
+# "Менеджер-аналитик маркетплейсов", "Бухгалтер (офис в г. Казань)",
+# "счётчика-ревизора", "Офис-менеджер", "Менеджер по продажам СИП, ВОЛС,
+# СКС", "Заместитель директора магазина" all appeared as real uncategorized
+# titles. Deliberately narrow/curated (not "anything uncategorized") --
+# uncategorized-but-plausibly-legitimate blue-collar content (e.g.
+# "Кондитер", "Оператор на производство") must NOT be swept in here, so this
+# is a positive keyword match, not a catch-all for category-match failure.
+OFF_TARGET_RE = re.compile(
+    r'\bинженер|\bсметчик|\bтендер|\bаналитик|\bюрист|\bбухгалтер|\bмаркетолог|\bревизор|'
+    r'офис[\s-]?менеджер|менеджер\s+по\s+продажам|\bдиректор',
+    re.IGNORECASE,
+)
+
+
 def address_matches_in_text(text):
     """{(pattern_name, normalized_match_string)} -- normalized so the same
     address repeated across many near-duplicate reposted messages (observed
@@ -124,6 +150,8 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
             "category_hit_messages": [], "verified_brand_hit_messages": [],
             "verified_relevant_examples": [],
             "address_matches": set(),
+            "has_pvz_mention": False, "pvz_hits": [],
+            "off_target_count": 0, "messages_seen": 0, "off_target_examples": [],
         }
         for cid in candidate_ids
     }
@@ -160,6 +188,14 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
         verified_brands_this_msg = brands & acr.CPA_VERIFIED_EMPLOYERS
         msg_verified_relevant = bool(matched_categories) and bool(verified_brands_this_msg)
         msg_address_matches = address_matches_in_text(text)
+        msg_is_pvz = bool(PVZ_RE.search(text))
+        # off-target noise: matches the curated keyword list AND doesn't
+        # match a target category AND isn't already military/agency/PVZ --
+        # those have their own handling, not double-counted here.
+        msg_is_off_target = (
+            bool(OFF_TARGET_RE.search(text)) and not matched_categories
+            and not is_military and not agency_match and not msg_is_pvz
+        )
 
         for cid in matched_cids:
             ev = evidence[cid]
@@ -180,6 +216,15 @@ def collect_debug_evidence(candidate_ids, contact_to_canonical):
             ev["categories"] |= matched_categories
             ev["has_verified_relevant_message"] = ev["has_verified_relevant_message"] or msg_verified_relevant
             ev["address_matches"] |= msg_address_matches
+            ev["messages_seen"] += 1
+            if msg_is_pvz:
+                ev["has_pvz_mention"] = True
+                if len(ev["pvz_hits"]) < 2:
+                    ev["pvz_hits"].append(title)
+            if msg_is_off_target:
+                ev["off_target_count"] += 1
+                if len(ev["off_target_examples"]) < 3:
+                    ev["off_target_examples"].append(title)
             # Diagnostic only (not used by production code): track messages
             # that had a category match, and separately messages that had a
             # verified-brand match, even when they didn't co-occur -- so a
@@ -402,12 +447,29 @@ def main():
         cat_count = len(ev["categories"])
         addr_count = len(ev["address_matches"])
         corp = acr.has_corp_domain(identities[cid])
+        off_frac = ev["off_target_count"] / ev["messages_seen"] if ev["messages_seen"] else 0.0
         print(f"\n  {cid}:")
         print(f"    corp_domain={corp}  (main-eligibility gate -- must be False)")
         print(f"    category_count={cat_count}  categories={sorted(ev['categories'])}")
         print(f"    address_location_count={addr_count}  matches={sorted(ev['address_matches'])}")
-    print("\n  (category_count and address_location_count both feed the score as soft signals, not")
-    print("   gates -- shown here so a high value on either wouldn't go unnoticed before export)")
+        print(f"    has_pvz_mention={ev['has_pvz_mention']}  hits={ev['pvz_hits']}  (hard-exclude gate -- must be False)")
+        print(f"    off_target_fraction={off_frac:.2f} ({ev['off_target_count']}/{ev['messages_seen']} messages)  "
+              f"examples={ev['off_target_examples']}")
+    print("\n  (category_count, address_location_count, off_target_fraction feed the score as soft")
+    print("   signals; has_pvz_mention is a hard exclude -- all shown here so nothing goes unnoticed)")
+
+    print("\n" + "=" * 78)
+    print("off_target_fraction / has_pvz_mention by verdict (full labeled set)")
+    print("=" * 78)
+    for lbl in LABELS:
+        cids = [cid for cid, v in labeled if v == lbl]
+        if not cids:
+            continue
+        fracs = sorted((evidence[cid]["off_target_count"] / evidence[cid]["messages_seen"]
+                         if evidence[cid]["messages_seen"] else 0.0) for cid in cids)
+        pvz_n = sum(1 for cid in cids if evidence[cid]["has_pvz_mention"])
+        print(f"  {LABEL_EN[lbl]}: off_target_fraction median={statistics.median(fracs):.2f} "
+              f"max={fracs[-1]:.2f}  |  has_pvz_mention: {pvz_n}/{len(cids)}")
 
     print("\n" + "=" * 78)
     print("category_count / address_location_count distribution across the FULL labeled set")

@@ -7,36 +7,47 @@ select_candidates() (username_count>=2 only), which validate_v2.py showed
 returns exactly the already-labeled 135 -- a dead end for export. This script
 deliberately uses the broader definition.
 
-Excludes all 135 canonical_id already present in the root ground-truth
-workbook (any вердикт, including the blank row), then applies:
+Excludes all canonical_id already present in the root ground-truth workbook
+(any вердикт, including the blank row -- 189 as of the last merge: 135
+original + 54 newly labeled from this pipeline's own prior export), then
+applies:
 
-  HARD excludes (cleared by validate_v2.py: 0 false positives on both known
-  web identities) -- has_military_flag, has_agency_self_id, NOT
-  has_verified_relevant_message (category AND a CPA-verified employer brand
-  matched on the SAME message text -- fixes an earlier identity-level union
-  bug where categories and brands were each accumulated independently across
-  ALL of an identity's messages, so a category from one message and a brand
-  from a completely unrelated message could combine into a false "relevant"
-  signal with no real co-occurrence).
+  HARD excludes (re-validated on the full 189-identity ground truth after
+  each merge: 0 false positives on any known web identity) --
+  has_military_flag, has_agency_self_id, NOT has_verified_relevant_message
+  (category AND a CPA-verified employer brand matched on the SAME message
+  text -- fixes an earlier identity-level union bug where categories and
+  brands were each accumulated independently across ALL of an identity's
+  messages), has_pvz_mention (NEW -- Арсений: "пункт выдачи"/ПВЗ roles are
+  single/few-person points, not mass-hire targets; confirmed on real message
+  text that PVZ postings get swept into "Курьеры и доставка" because the job
+  description mentions receiving deliveries FROM a courier, not because the
+  role is one -- full hard-exclude, not a soft signal, per instruction).
 
   SOFT signals only, used for ranking, never for exclusion -- employer_count
   (bucketed per the CLAUDE.md hypothesis: 2-3 up, 0 neutral, 1 or 4+ down;
-  still unconfirmed at scale), content_volume_flag, has_ref_link, channel_count
-  and message_count (NON-monotonic tertile buckets computed on the actual
-  surviving population: bottom neutral, middle the positive peak, top
-  NEGATIVE -- same shape as employer_count, not the old top-is-best mapping;
-  concrete motivation: a 5-category aggregator-pattern identity with high
-  channel/message count previously outscored a clean single-vertical,
-  verified courier identity specifically because of its modest channel/
-  message count), category_count (new -- penalizes category dispersion above
-  the survivor population's top-tertile boundary; manual observation was
-  "4+ categories looks like aggregator noise", checked against the actual
-  distribution, not hardcoded), address_location_count (new -- distinct
-  street/metro/mall/bare-address matches across an identity's messages,
-  deduped so the same address repeated across near-duplicate reposts doesn't
-  inflate the count; penalizes above the top-tertile boundary; validated
-  against real message text before use -- see validate_v2.py's
-  ADDRESS_PATTERNS and the conversation record for the false-positive check).
+  still unconfirmed at scale), content_volume_flag, has_ref_link,
+  category_count (penalizes category dispersion above the survivor
+  population's empirical top-tertile boundary), address_location_count
+  (distinct street/metro/mall/bare-address matches across an identity's
+  messages, deduped so the same address repeated across near-duplicate
+  reposts doesn't inflate the count; validated against real message text --
+  see validate_v2.py's ADDRESS_PATTERNS), off_target_fraction (NEW -- share
+  of an identity's messages matching a curated off-target white-collar
+  keyword list -- инженер/сметчик/тендер/аналитик/юрист/бухгалтер/
+  маркетолог/ревизор/офис-менеджер/менеджер по продажам/директор -- AND
+  matching no target category AND not already military/agency/PVZ; built
+  and validated against real uncategorized message titles, deliberately
+  narrow so plausibly-legitimate-but-uncovered content like "Кондитер"
+  isn't swept in). All four penalty thresholds are the survivor
+  population's own top-tertile boundary, not hardcoded guesses.
+
+  channel_count/message_count are REMOVED from scoring (kept as reported
+  columns only): diagnosed across the full 189-identity ground truth after
+  the second merge and found NOT to cleanly separate web from non-web --
+  heavy overlap across the whole range, with outliers in both classes (one
+  known web identity has message_count=30). No signal was invented to
+  replace them, per instruction.
 
   corp_domain is NOT part of the additive score -- it is a direct
   main-eligibility GATE: corp_domain=True identities are excluded from
@@ -109,37 +120,18 @@ def employer_bucket_score(employer_count):
     return -1  # 1 or 4+
 
 
-def tertile_bucketer(values):
-    """Returns (bucket_fn, q1, q2) -- bucket_fn maps a value to 0/1/2 by
-    tertile of the ACTUAL surviving population, not a guessed cut point.
+def tertile_boundaries(values):
+    """Returns (q1, q2) tertile cut points of the ACTUAL population -- not a
+    guessed cut point. Every current caller uses these only for a one-sided
+    "> q2 is high, penalize" check (category_count, address_location_count,
+    off_target_fraction); none currently need a 3-way bucket assignment.
     Degenerate case (population too small/uniform for statistics.quantiles)
-    falls back to a constant-0 bucket_fn with q1=q2=the single value --
-    ALWAYS a 3-tuple, so callers never need a special-cased unpack."""
+    returns q1=q2=the single value."""
     clean = sorted(v for v in values if v is not None)
     if len(clean) < 3 or clean[0] == clean[-1]:
         only = clean[0] if clean else 0
-        return (lambda x: 0), only, only
-    q1, q2 = statistics.quantiles(clean, n=3)
-
-    def bucket(x):
-        if x > q2:
-            return 2
-        if x > q1:
-            return 1
-        return 0
-
-    return bucket, q1, q2
-
-
-def nonmonotonic_bucket_score(bucket_idx):
-    """Same shape as employer_bucket_score: bottom tertile neutral, middle
-    tertile the positive peak, top tertile negative. Used for channel_count/
-    message_count -- concrete motivation (see conversation record): the
-    previous monotonic mapping let a 5-category, high-channel/message-count
-    aggregator-pattern identity outscore a clean single-vertical, verified
-    courier identity specifically because of the courier's modest channel/
-    message count. High volume alone is no longer treated as purely good."""
-    return {0: 0, 1: 2, 2: -1}[bucket_idx]
+        return only, only
+    return statistics.quantiles(clean, n=3)
 
 
 def main():
@@ -206,15 +198,19 @@ def main():
     mil = {cid for cid in export_pool if evidence[cid]["has_military_flag"]}
     ag = {cid for cid in export_pool if evidence[cid]["has_agency_self_id"]}
     not_verified = {cid for cid in export_pool if not evidence[cid]["has_verified_relevant_message"]}
-    excluded = mil | ag | not_verified
+    pvz = {cid for cid in export_pool if evidence[cid]["has_pvz_mention"]}
+    excluded = mil | ag | not_verified | pvz
     print(f"has_military_flag=True:                 {len(mil)}")
     print(f"has_agency_self_id=True:                {len(ag)}")
     print(f"NOT has_verified_relevant_message:      {len(not_verified)}")
+    print(f"has_pvz_mention=True (NEW -- Арсений: ПВЗ is not a mass-hire target, full hard-exclude): {len(pvz)}")
     print(f"  overlap military & agency:                {len(mil & ag)}")
     print(f"  overlap military & not_verified:          {len(mil & not_verified)}")
     print(f"  overlap agency & not_verified:             {len(ag & not_verified)}")
-    print(f"  overlap all three:                         {len(mil & ag & not_verified)}")
-    print(f"Union excluded (any of the three):          {len(excluded)}")
+    print(f"  overlap pvz & not_verified:                 {len(pvz & not_verified)} "
+          f"(PVZ mentions usually already fail has_verified_relevant_message too, but not always)")
+    print(f"  overlap all four:                          {len(mil & ag & not_verified & pvz)}")
+    print(f"Union excluded (any of the four):           {len(excluded)}")
 
     survivors = export_pool - excluded
     print(f"\nSurviving after hard excludes: {len(survivors)}")
@@ -233,51 +229,83 @@ def main():
     print(f"content_volume_flag True: {cv_true_surv}/{len(survivors)} "
           f"({100*cv_true_surv/len(survivors):.1f}%)" if survivors else "n/a")
 
+    # channel_count/message_count: REMOVED from scoring this round. Diagnosed
+    # across the full 189-identity ground truth (see conversation record):
+    # web message_count = [1,2,3,5,30] (median 3) vs non-web median 4, with
+    # heavy overlap across the whole range and outliers in BOTH classes (one
+    # known web has message_count=30, well into what would be "top tertile,
+    # penalized" territory). No clean web/non-web separation exists on either
+    # field -- kept as reported columns for manual-review context only, not
+    # replaced with a different bucketing since none is empirically justified.
     channel_counts = {cid: len(identities[cid]["channels"]) for cid in survivors}
     message_counts = {cid: identities[cid]["message_count"] for cid in survivors}
-    ch_bucket, ch_q1, ch_q2 = tertile_bucketer(channel_counts.values())
-    msg_bucket, msg_q1, msg_q2 = tertile_bucketer(message_counts.values())
-    print(f"channel_count tertile cut points (from actual survivor distribution): "
-          f"q1={ch_q1:.1f} q2={ch_q2:.1f}")
-    print(f"message_count tertile cut points (from actual survivor distribution): "
-          f"q1={msg_q1:.1f} q2={msg_q2:.1f}")
+    print(f"channel_count / message_count: reported only, NOT scored this round (no clean "
+          f"web/non-web signal found across the full 189 labeled identities -- see commit message)")
 
-    # --- category_count / address_location_count: new negative soft signals,
-    # thresholds derived from the ACTUAL survivor distribution (top-tertile
-    # boundary), not hardcoded ---
+    # --- category_count / address_location_count / off_target_fraction:
+    # negative soft signals, thresholds derived from the ACTUAL survivor
+    # distribution (top-tertile boundary), not hardcoded ---
     category_counts = {cid: len(evidence[cid]["categories"]) for cid in survivors}
     address_counts = {cid: len(evidence[cid]["address_matches"]) for cid in survivors}
-    _, cat_q1, cat_q2 = tertile_bucketer(category_counts.values())
-    _, addr_q1, addr_q2 = tertile_bucketer(address_counts.values())
+    off_target_fractions = {
+        cid: (evidence[cid]["off_target_count"] / evidence[cid]["messages_seen"]
+              if evidence[cid]["messages_seen"] else 0.0)
+        for cid in survivors
+    }
+    cat_q1, cat_q2 = tertile_boundaries(category_counts.values())
+    addr_q1, addr_q2 = tertile_boundaries(address_counts.values())
+    off_q1, off_q2_naive = tertile_boundaries(off_target_fractions.values())
+    off_q2 = off_q2_naive
 
     print(f"\ncategory_count distribution: " +
           ", ".join(f"{k}:{v}" for k, v in sorted(Counter(category_counts.values()).items())))
     print(f"category_count top-tertile boundary (q2) = {cat_q2:.2f} -- "
           f"penalize category_count > {cat_q2:.2f}")
-    print(f"(manual observation was '4+ categories looks like aggregator noise' -- "
-          f"{'MATCHES' if round(cat_q2) in (3, 4) else 'DIVERGES FROM'} the empirical top-tertile "
-          f"boundary, using the empirical value either way)")
 
     print(f"\naddress_location_count distribution: " +
           ", ".join(f"{k}:{v}" for k, v in sorted(Counter(address_counts.values()).items())))
     print(f"address_location_count top-tertile boundary (q2) = {addr_q2:.2f} -- "
           f"penalize address_location_count > {addr_q2:.2f}")
 
+    print(f"\noff_target_fraction distribution (rounded to 2dp): " +
+          ", ".join(f"{k:.2f}:{v}" for k, v in sorted(Counter(round(x, 2) for x in off_target_fractions.values()).items())))
+    print(f"off_target_fraction population-wide top-tertile boundary (q2) = {off_q2_naive:.2f}")
+
+    if off_q2_naive <= 0:
+        # Degenerate case: off_target_fraction is heavily zero-inflated
+        # (most identities have off_target_fraction==0.0 exactly, unlike the
+        # integer counts above which have enough spread near their mode to
+        # avoid this). A population-wide tertile boundary of 0 would mean
+        # "penalize ANY nonzero value" -- not what "high fraction" should
+        # mean. Fall back to the tertile boundary of the NONZERO subset only
+        # -- still purely empirical, not a guessed number, just computed over
+        # the population where the signal actually varies.
+        zero_n = sum(1 for v in off_target_fractions.values() if v == 0)
+        nonzero_off = [v for v in off_target_fractions.values() if v > 0]
+        print(f"  -- degenerate: {zero_n}/{len(off_target_fractions)} survivors share off_target_fraction="
+              f"0.0 exactly, so a population-wide boundary of {off_q2_naive:.2f} would penalize ANY nonzero "
+              f"value, not a meaningfully 'high' fraction. Falling back to the tertile boundary of the "
+              f"{len(nonzero_off)} NONZERO identities only.")
+        if nonzero_off:
+            off_q1, off_q2 = tertile_boundaries(nonzero_off)
+    print(f"off_target_fraction FINAL threshold used: penalize off_target_fraction > {off_q2:.2f}")
+
     # --- corp_domain: main-eligibility GATE, not an additive score term ---
     corp_domain_flags = {cid: acr.has_corp_domain(identities[cid]) for cid in survivors}
     print(f"\ncorp_domain=True among survivors: {sum(corp_domain_flags.values())}/{len(survivors)} "
           f"-- these can still be exported/borderline, just never main, regardless of score.")
 
-    # --- score (corp_domain removed -- see gate above) ---
+    # --- score (corp_domain, channel_count, message_count all removed -- see above) ---
     print("\nScore formula (additive integer, deterministic, all inputs SOFT per instruction):")
     print("  employer_count bucket: 2-3 -> +2, 0 -> 0, 1 or 4+ -> -1  (CLAUDE.md hypothesis, unconfirmed)")
     print("  content_volume_flag:   True -> +1, False -> 0")
     print("  has_ref_link:          True -> +1, False -> 0")
-    print("  channel_count tertile:  bottom -> 0, mid -> +2, top -> -1  (NON-monotonic, was top->+2)")
-    print("  message_count tertile:  bottom -> 0, mid -> +2, top -> -1  (NON-monotonic, was top->+2)")
-    print(f"  category_count:         > {cat_q2:.2f} -> -1, else 0  (NEW)")
-    print(f"  address_location_count: > {addr_q2:.2f} -> -1, else 0  (NEW)")
-    print("  corp_domain:            REMOVED from score -- now a direct main-eligibility gate (see below)")
+    print(f"  category_count:         > {cat_q2:.2f} -> -1, else 0")
+    print(f"  address_location_count: > {addr_q2:.2f} -> -1, else 0")
+    print(f"  off_target_fraction:    > {off_q2:.2f} -> -1, else 0  (NEW)")
+    print("  channel_count/message_count: REMOVED (no clean signal, see above)")
+    print("  corp_domain:            REMOVED -- direct main-eligibility gate (see below)")
+    print("  has_pvz_mention:        REMOVED -- hard exclude, never reaches scoring (see above)")
 
     scores = {}
     for cid in survivors:
@@ -286,10 +314,9 @@ def main():
         s += employer_bucket_score(len(ev["brands"]))
         s += 1 if ev["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS else 0
         s += 1 if ev["has_ref_link"] else 0
-        s += nonmonotonic_bucket_score(ch_bucket(channel_counts[cid]))
-        s += nonmonotonic_bucket_score(msg_bucket(message_counts[cid]))
         s += -1 if category_counts[cid] > cat_q2 else 0
         s += -1 if address_counts[cid] > addr_q2 else 0
+        s += -1 if off_target_fractions[cid] > off_q2 else 0
         scores[cid] = s
 
     score_values = sorted(scores.values())
@@ -349,7 +376,8 @@ def main():
         ex = ev["verified_relevant_examples"][0] if ev["verified_relevant_examples"] else None
         print(f"\n{i}. {cid}  score={scores[cid]}  "
               f"category_count={category_counts[cid]}  address_location_count={address_counts[cid]}  "
-              f"channel_count={channel_counts[cid]}  message_count={message_counts[cid]}")
+              f"off_target_fraction={off_target_fractions[cid]:.2f}  "
+              f"(channel_count={channel_counts[cid]} message_count={message_counts[cid]}, reported only)")
         print(f"   brands={sorted(ev['brands'])}  categories={sorted(ev['categories'])}")
         if ev["address_matches"]:
             print(f"   address_matches={sorted(ev['address_matches'])}")
@@ -381,15 +409,18 @@ def main():
     FIELDNAMES = ["вердикт", "canonical_id", "score", "usernames", "phones", "corp_domain",
                   "hr_hint", "has_ref_link", "brands", "employer_count", "multibrand",
                   "categories", "category_count", "has_military_flag", "has_agency_self_id",
-                  "content_volume_flag", "has_verified_relevant_message", "address_location_count",
-                  "address_matches", "channel_count", "message_count", "first_seen",
+                  "has_pvz_mention", "content_volume_flag", "has_verified_relevant_message",
+                  "address_location_count", "address_matches", "off_target_fraction",
+                  "off_target_examples", "channel_count", "message_count", "first_seen",
                   "last_seen", "sample_titles", "channels", "channel_links"]
     COLUMN_WIDTHS = {
         "вердикт": 14, "canonical_id": 14, "score": 8, "usernames": 45, "phones": 35,
         "corp_domain": 12, "hr_hint": 10, "has_ref_link": 13, "brands": 35,
         "employer_count": 14, "multibrand": 12, "categories": 40, "category_count": 14,
-        "has_military_flag": 16, "has_agency_self_id": 18, "content_volume_flag": 18,
+        "has_military_flag": 16, "has_agency_self_id": 18, "has_pvz_mention": 16,
+        "content_volume_flag": 18,
         "has_verified_relevant_message": 22, "address_location_count": 20, "address_matches": 60,
+        "off_target_fraction": 16, "off_target_examples": 50,
         "channel_count": 14, "message_count": 14, "first_seen": 18, "last_seen": 18,
         "sample_titles": 80, "channels": 55, "channel_links": 60,
     }
@@ -416,10 +447,13 @@ def main():
             "category_count": len(categories),
             "has_military_flag": ev["has_military_flag"],
             "has_agency_self_id": ev["has_agency_self_id"],
+            "has_pvz_mention": ev["has_pvz_mention"],
             "content_volume_flag": ev["max_text_len"] >= acr.CONTENT_VOLUME_MIN_CHARS,
             "has_verified_relevant_message": ev["has_verified_relevant_message"],
             "address_location_count": len(ev["address_matches"]),
             "address_matches": ", ".join(f"{name}:{val}" for name, val in sorted(ev["address_matches"])),
+            "off_target_fraction": round(ev["off_target_count"] / ev["messages_seen"], 3) if ev["messages_seen"] else 0.0,
+            "off_target_examples": " | ".join(ev["off_target_examples"]),
             "channel_count": len(channels_list),
             "message_count": ident["message_count"],
             "first_seen": acr.parse_dt(ident["first_seen"]),
