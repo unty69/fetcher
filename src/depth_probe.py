@@ -1,16 +1,17 @@
 """
 depth_probe.py — разведочный скрипт: сколько квалифицирующих сообщений
-реально есть в подборке каналов за 3+ года, помесячно. НЕ часть основного
-пайплайна: свой список каналов (не input/channels_tier1.txt), свой файл
-cache/dump_depth_probe.jsonl (не cache/dump.jsonl). Логику извлечения,
-квалификации и сессию переиспользует из crawl.py/build.py, не дублирует.
+реально есть в подборке каналов за последние 270 дней, помесячно. НЕ часть
+основного пайплайна: свой список каналов (не input/channels_tier1.txt), свой
+файл cache/dump_depth_v2.jsonl (не cache/dump.jsonl, не
+cache/dump_depth_probe.jsonl). Логику извлечения, квалификации и сессию
+переиспользует из crawl.py/build.py, не дублирует.
 
 Идемпотентность по каналу через offset_id: если у канала уже есть записи в
-dump_depth_probe.jsonl, дальше идём от min(message_id) вглубь истории, не
-перечитывая уже собранное. Тот же offset_id используется для восстановления
-после FloodWaitError -- ретраим не с начала канала (как в crawl.py), а с
-последнего успешно обработанного сообщения: для каналов такого объёма
-ретрай с нуля был бы слишком расточительным.
+DUMP_PATH, дальше идём от min(message_id) вглубь истории, не перечитывая уже
+собранное. Тот же offset_id используется для восстановления после
+FloodWaitError -- ретраим не с начала канала (как в crawl.py), а с последнего
+успешно обработанного сообщения: для каналов такого объёма ретрай с нуля был
+бы слишком расточительным.
 """
 
 import asyncio
@@ -19,7 +20,7 @@ import random
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -40,13 +41,32 @@ from build import (  # noqa: E402
 )
 from config import CRAWL_PAUSE_RANGE  # noqa: E402
 
+# 2026-08-21: expanded from the original 7 to the 11 channels actually present
+# in cache/dump_depth_probe.jsonl (verified against a fresh channel scan of
+# that file: its 11 distinct channels are exactly these original 7 union
+# rabota_moskval / rabota_v_kaliningradeq / samare_vakansiy /
+# sankt_peterburg_vakansiy from input/channels.txt -- those 4 already had
+# messages in the file despite never being in this list; main()'s "channels
+# outside CHANNELS are preserved as-is" behavior is what kept them there
+# across runs without this script ever actively crawling them itself).
 CHANNELS = [
     "rabotab_kazan", "moskvan", "v_rabota_moskve", "rabotan_samara",
     "sankt_vakansiy_peterburg", "v_rabota_ekb", "v_vakansiy_rostove",
+    "rabota_moskval", "rabota_v_kaliningradeq", "samare_vakansiy",
+    "sankt_peterburg_vakansiy",
 ]
 
-CUTOFF = datetime(2023, 1, 1, tzinfo=timezone.utc)
-DUMP_PATH = BASE_DIR / "cache" / "dump_depth_probe.jsonl"
+# 2026-08-21: rolling 270-day window (was a fixed 2023-01-01 cutoff, ~3.6
+# years) per the red-team audit's recommended cap. Output redirected to a new
+# file rather than continuing to write into dump_depth_probe.jsonl, whose
+# provenance is already unclear (a population-count reconstruction gap and
+# this same 11-vs-7 channel question were both open before this change) --
+# mixing newly-understood data into that file would only compound the
+# ambiguity. cache/dump_depth_v2.jsonl is gitignored and never committed,
+# same as every other cache/dump*.jsonl.
+CUTOFF_DAYS = 270
+CUTOFF = datetime.now(timezone.utc) - timedelta(days=CUTOFF_DAYS)
+DUMP_PATH = BASE_DIR / "cache" / "dump_depth_v2.jsonl"
 
 HEARTBEAT_EVERY = 1000
 
