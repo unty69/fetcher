@@ -22,11 +22,14 @@ sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openpyxl import Workbook  # noqa: E402
 from openpyxl.styles import Font  # noqa: E402
+from openpyxl.utils import get_column_letter  # noqa: E402
 from openpyxl.worksheet.datavalidation import DataValidation  # noqa: E402
 
 import build  # noqa: E402
 from identity_graph import iter_dump_paths, load_messages, message_contact_nodes  # noqa: E402
-from search_employers import EMPLOYERS  # noqa: E402
+from search_employers import (  # noqa: E402
+    EMPLOYERS, category_patterns as CATEGORY_PATTERNS, CPA_VERIFIED_EMPLOYERS,
+)
 
 IDENTITY_GRAPH_PATH = BASE_DIR / "cache" / "identity_graph.json"
 OUTPUT_XLSX = BASE_DIR / "output" / "alt_clusters_review.xlsx"
@@ -50,6 +53,24 @@ HR_HINT_RE = re.compile(
 )
 
 BRAND_PATTERNS = {name: re.compile(pat, re.IGNORECASE) for name, pat in EMPLOYERS.items()}
+
+# Agency SELF-identification -- the identity presenting itself as an agency,
+# not just mentioning that some employer's post came from an agency (see
+# CLAUDE.md "Agency Self-ID"). Requires the compound construction, not the
+# bare substring "агентство" -- "агентство X ищет сотрудника" does not match
+# any of these three. Stems (\w*) instead of exact forms to cover Russian
+# case declension ("кадровое агентство" / "кадрового агентства" / etc.).
+# Validated against the labeled dataset in validate_v2.py, not assumed correct.
+AGENCY_SELF_ID_RE = re.compile(
+    r'кадров\w*\s+агентств\w*|рекрутингов\w*\s+агентств\w*|агентств\w*\s+по\s+подбор\w*',
+    re.IGNORECASE,
+)
+
+# Provisional starting hypothesis, NOT validated -- see CLAUDE.md "Content
+# Sufficiency". content_volume_flag is a soft signal; validate_v2.py reports
+# the actual max_text_len distribution across labeled classes so this number
+# can be revisited with evidence instead of guesswork.
+CONTENT_VOLUME_MIN_CHARS = 80
 
 
 # --- отбор кандидатов -------------------------------------------------------
@@ -101,7 +122,15 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
     Для каждого сообщения контакты переводятся в node_key и ищутся в уже
     готовом contact_to_canonical -- НИКАКИХ новых рёбер/связей не строится,
     только чтение существующей склейки."""
-    evidence = {cid: {"brands": set(), "has_ref_link": False, "titles": []} for cid in candidate_ids}
+    evidence = {
+        cid: {
+            "brands": set(), "has_ref_link": False, "titles": [],
+            "has_military_flag": False, "has_agency_self_id": False,
+            "categories": set(), "max_text_len": 0,
+            "has_verified_relevant_message": False,
+        }
+        for cid in candidate_ids
+    }
 
     ref_domains = build.load_ref_domains()
     messages = load_messages(iter_dump_paths())
@@ -118,6 +147,10 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
         if not matched_cids:
             continue
 
+        # Full message text (msg["text"]) -- NOT title_of()/sample_titles,
+        # which truncate to the first line / 120 chars (see CLAUDE.md
+        # "Full-Text Requirement"). category_patterns is reused directly from
+        # search_employers.py rather than via its truncating category_match().
         text = msg.get("text") or ""
         brands = {name for name, pat in BRAND_PATTERNS.items() if pat.search(text)}
         ref_link = any(
@@ -125,6 +158,20 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
             for u in msg["urls"] if not build.is_tg_resolve(u["url"])
         )
         title = title_of(text)
+        is_military = build.is_military_content(text)
+        is_agency_self_id = bool(AGENCY_SELF_ID_RE.search(text))
+        matched_categories = {cat for cat, pat in CATEGORY_PATTERNS.items() if pat.search(text)}
+        text_len = len(text.strip())
+
+        # Message-level co-occurrence, NOT identity-level union: category and
+        # CPA-verified employer must both match on THIS SAME message text.
+        # brands/categories below are still unioned across an identity's
+        # messages (soft signals, unchanged) -- that union is exactly what
+        # let "categories non-empty" and "brands non-empty" come from two
+        # unrelated messages with no actual co-occurrence. This flag fixes
+        # that by checking both conditions before the per-message data is
+        # folded into the identity-level union.
+        msg_verified_relevant = bool(matched_categories) and bool(brands & CPA_VERIFIED_EMPLOYERS)
 
         for cid in matched_cids:
             ev = evidence[cid]
@@ -132,6 +179,12 @@ def collect_evidence(candidate_ids: set, contact_to_canonical: dict):
             ev["has_ref_link"] = ev["has_ref_link"] or ref_link
             if title and title not in ev["titles"] and len(ev["titles"]) < 3:
                 ev["titles"].append(title)
+            ev["has_military_flag"] = ev["has_military_flag"] or is_military
+            ev["has_agency_self_id"] = ev["has_agency_self_id"] or is_agency_self_id
+            ev["categories"] |= matched_categories
+            ev["has_verified_relevant_message"] = ev["has_verified_relevant_message"] or msg_verified_relevant
+            if text_len > ev["max_text_len"]:
+                ev["max_text_len"] = text_len
 
     return evidence
 
@@ -152,6 +205,7 @@ def build_rows(candidates: dict, evidence: dict):
         corp = has_corp_domain(ident)
         hr = has_hr_hint(ident)
         brands = sorted(ev["brands"])
+        categories = sorted(ev["categories"])
         channels_list = ident.get("channels") or []
         rows.append({
             "вердикт": "",
@@ -173,6 +227,13 @@ def build_rows(candidates: dict, evidence: dict):
             # t.me/s/ открывает веб-превью без аккаунта.
             "channels": ", ".join(channels_list),
             "channel_links": " ".join(f"https://t.me/s/{ch}" for ch in channels_list),
+            # --- new signals (full message text, see collect_evidence()) ---
+            "employer_count": len(brands),
+            "has_military_flag": ev["has_military_flag"],
+            "has_agency_self_id": ev["has_agency_self_id"],
+            "categories": ", ".join(categories),
+            "content_volume_flag": ev["max_text_len"] >= CONTENT_VOLUME_MIN_CHARS,
+            "has_verified_relevant_message": ev["has_verified_relevant_message"],
         })
 
     rows.sort(key=lambda r: (
@@ -190,7 +251,9 @@ def build_rows(candidates: dict, evidence: dict):
 
 FIELDNAMES = ["вердикт", "canonical_id", "usernames", "phones", "corp_domain", "hr_hint",
               "has_ref_link", "brands", "multibrand", "channel_count", "message_count",
-              "first_seen", "last_seen", "sample_titles", "channels", "channel_links"]
+              "first_seen", "last_seen", "sample_titles", "channels", "channel_links",
+              "employer_count", "has_military_flag", "has_agency_self_id", "categories",
+              "content_volume_flag", "has_verified_relevant_message"]
 
 COLUMN_WIDTHS = {
     "вердикт": 14, "canonical_id": 14, "usernames": 45, "phones": 35,
@@ -198,6 +261,8 @@ COLUMN_WIDTHS = {
     "multibrand": 12, "channel_count": 14, "message_count": 14,
     "first_seen": 18, "last_seen": 18, "sample_titles": 80,
     "channels": 55, "channel_links": 60,
+    "employer_count": 14, "has_military_flag": 16, "has_agency_self_id": 18,
+    "categories": 40, "content_volume_flag": 18, "has_verified_relevant_message": 22,
 }
 
 
@@ -218,8 +283,11 @@ def write_workbook(rows: list, path: Path):
     ws.add_data_validation(dv)
     dv.add(f"A2:A{max(len(rows) + 1, 2)}")
 
-    for col_letter, header in zip("ABCDEFGHIJKLMNOP", FIELDNAMES):
-        ws.column_dimensions[col_letter].width = COLUMN_WIDTHS[header]
+    # get_column_letter(), not a hardcoded "ABCDEFGHIJKLMNOP" -- that string
+    # silently stopped covering FIELDNAMES once new signal columns pushed the
+    # count past 16 (zip() just drops the extras, no error).
+    for i, header in enumerate(FIELDNAMES, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = COLUMN_WIDTHS[header]
 
     ws.freeze_panes = "A2"
 

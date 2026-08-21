@@ -76,7 +76,33 @@ EMPLOYERS = {
     "Яндекс Еда": r"Яндекс\s*Еда", "Яндекс Лавка": r"Яндекс\s*Лавка", "Яндекс Маркет": r"Яндекс\s*Маркет",
     "Восток Запад Логистика": r"Восток\s*Запад\s*Логистика", "Клин Лабс": r"Клин\s*Лабс",
     "Достависта": r"Достависта", "ВТБ": r"\bВТБ\b",
+    "Самокат": r"\bСамокат\b", "Перекрёсток": r"Перекр[её]сток", "Тануки": r"\bТануки\b",
+    "СДЭК": r"\bСДЭК\b", "Мегафон": r"МегаФон|Мегафон", "InHome": r"\bInHome\b",
 }
+
+# Small explicitly-marked subset of EMPLOYERS: employers CONFIRMED to have a
+# real CPA/affiliate offer on a competing platform, not just brand-recognized
+# in text. Used by alt_cluster_review.py's has_verified_relevant_message gate
+# (category match AND a verified-employer brand match on the SAME message).
+#
+# Two names from the source list didn't map onto EMPLOYERS as literal keys --
+# resolved explicitly rather than assumed:
+#   "Магнит" is not a key (EMPLOYERS only has the two sub-brands below) -- both
+#   included, no basis to prefer one over the other.
+#   "СберМаркет" is not a separate key -- it's already an alternate pattern
+#   under "Купер" (r"\bКупер\b|Сбермаркет|СберМаркет|SberMarket", same
+#   company post-rebrand). Adding a second "СберМаркет" key would duplicate an
+#   existing entry, which CLAUDE.md's employer-dictionary rule forbids.
+#   "Купер" is included here instead so the intent (mark that offer verified)
+#   still holds.
+CPA_VERIFIED_EMPLOYERS = {
+    "VOXYS", "ОНЕКТА", "Дикси", "Яндекс Еда", "ROSTIC'S", "Восток Запад Логистика",
+    "Самокат", "Магнит Заряд", "Магнит доставка", "Ozon", "X5 Доставка", "Альфа-Банк",
+    "Яндекс Маркет", "Efin", "4 Лапы", "ВТБ", "Клин Лабс", "Burger King", "МТС",
+    "Яндекс Лавка", "Домовёнок", "Достависта", "Тетрика", "lamoda", "Купер",
+}
+assert CPA_VERIFIED_EMPLOYERS <= set(EMPLOYERS), \
+    f"CPA_VERIFIED_EMPLOYERS has entries not in EMPLOYERS: {CPA_VERIFIED_EMPLOYERS - set(EMPLOYERS)}"
 
 CORP_DOMAINS = {
     "Ozon": ("ozon.ru",), "Т-Банк": ("tbank.ru", "tinkoff.ru"),
@@ -286,10 +312,14 @@ def main():
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
+    # custom_domain/has_address are documented (see module docstring) as soft
+    # sorting signals, not hard filters -- a hard exclusion on either would
+    # cut the confirmed web tkadysheva@happy-phone.ru (custom domain). They
+    # push a row down the list instead of removing it.
     review_rows = [r for r in rows if not r["platform_noise"] and not r["already_visible_to_pipeline"]
-                   and not r["likely_aggregator"] and not r["has_address"] and not r["custom_domain"]
+                   and not r["likely_aggregator"]
                    and (r["contact_type"], r["contact_value"]) not in already_marked]
-    review_rows.sort(key=lambda r: (-r["web_score"], -r["channel_count"]))
+    review_rows.sort(key=lambda r: (-r["web_score"], r["custom_domain"], r["has_address"], -r["channel_count"]))
 
     OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["вердикт", "employers", "employer_count", "categories", "web_score",
